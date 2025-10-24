@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 import mysql from 'mysql2/promise';
 const xlsx = require('xlsx');
 const path = require('path');
+const moment = require('moment');
 const fs = require('fs').promises;
 async function ensureDirectoryExists(directory) {
     try {
@@ -44,11 +45,11 @@ function parseExcelDate(value) {
             parts = value.split('/');
             return new Date(parts[2], parts[1] - 1, parts[0]);
         }
-        // yyyy-mm-dd (safe ISO)
+        // yyyy-mm-dd
         if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
             return new Date(value);
         }
-        // dd-MMM-yyyy (e.g., 23-Aug-2021)
+        // dd-MMM-yyyy (e.g. 23-Aug-2021)
         if (/^\d{2}-[A-Za-z]{3}-\d{4}$/.test(value)) {
             const [day, monStr, year] = value.split('-');
             const months = {
@@ -984,7 +985,7 @@ const deleteInstitution = async (req, res) => {
         });
     }
 };
-const getFormOptions = async (req, res) => {
+const getGlobalOptions = async () => {
     try {
         const rows = await ggBaseQuery(`SELECT id as value,description as label FROM roles WHERE name NOT IN ('admin', 'super')`);
         const categoryQuery = 'SELECT DISTINCT category FROM form_options';
@@ -1005,10 +1006,26 @@ const getFormOptions = async (req, res) => {
         console.log(results);
         // Step 5: Parse and return the results
         const formOptions = results[0]['categories_data'];
+        const finalData = {
+            rows,
+            form_data: formOptions
+        };
+        return finalData;
+    } catch (error) {
+        console.error(error);
+        const finalData = {
+            rows: [],
+            form_data: []
+        };
+        return finalData;
+    }
+}
+const getFormOptions = async (req, res) => {
+    try {
+        const getGlobalOptionsData = await getGlobalOptions();
         res.json({
             status: true,
-            data: rows,
-            form_data: formOptions
+            ...getGlobalOptionsData
         });
     } catch (error) {
         console.error(error);
@@ -1018,9 +1035,14 @@ const getFormOptions = async (req, res) => {
         });
     }
 };
+
+function formatDate(d) {
+    if (!d) return "";
+    const date = new Date(d);
+    return date.toISOString().split("T")[0];
+}
 const leadsImport = async (req, res) => {
     const reqBody = req.body;
-    console.log(reqBody);
     if (!req.files || !req.files.file) {
         return res.status(400).json({
             error: "No file uploaded"
@@ -1056,108 +1078,163 @@ const leadsImport = async (req, res) => {
             error: "Excel contains no data"
         });
     }
-    // map Excel headers to DB field names
-    const headerMap = {
-        "state": "state",
-        "prev_policy_type": "prev_policy_type",
-        "product": "product",
-        "vehicle_type": "vehicle_type",
-        "company": "sub_product", // ✅ map COMPANY -> sub_product
-        "tc": null, // ✅ TC not needed, skip
-        "reg_no": "reg_no",
-        "prev_policy_end_date": "prev_policy_end_date",
-        "prev_insurer": "prev_insurer",
-        "prev_pol_no": "prev_pol_no",
-        "prev_pol_premium": "prev_pol_premium",
-        "rto": "rto",
-        "reg_date": "reg_date",
-        "name": "name",
-        "mobile": "mobile",
-        "vehicle_make": "vehicle_make",
-        "vehicle_model_variant": "vehicle_model_variant",
-        "sale_amount": "sale_amount",
-        "engine_no": "engine_no",
-        "chasis_no": "chasis_no",
-        "address": "address",
-        "tc": "tc",
-        "fuel": "fuel",
+    // --- helper to normalize header text and map to canonical field names
+    const normalize = (s) => String(s || "").toLowerCase().trim().replace(/\s+/g, " ").replace(/[^a-z0-9 ]/g, "");
+    const mapHeaderToField = (hdr) => {
+        const h = normalize(hdr);
+        // common patterns => canonical DB field names
+        if (/reg.*no|regno|registration.*no|registration_no/.test(h)) return "reg_no";
+        if (/prev.*policy.*end.*date|prev.*end.*date|previous.*policy.*end/.test(h)) return "prev_policy_end_date";
+        if (/prev.*policy.*start.*date|prev.*start.*date/.test(h)) return "prev_policy_start_date";
+        if (/prev.*pol.*no|prevpol.*no|prev_policy_no/.test(h)) return "prev_pol_no";
+        if (/prev.*pol.*premium|prev.*premium|prev_pol_premium/.test(h)) return "prev_pol_premium";
+        if (/prev.*insur|previns|previous.*insur/.test(h)) return "prev_insurer";
+        if (/vehicle.*make/.test(h)) return "vehicle_make";
+        if (/vehicle.*model|variant/.test(h)) return "vehicle_model_variant";
+        if (/sale.*amount|sale_amount/.test(h)) return "sale_amount";
+        if (/engine.*no|engine_no/.test(h)) return "engine_no";
+        if (/chasis|chassis|chasis_no|chasisno/.test(h)) return "chasis_no";
+        if (/address/.test(h)) return "address";
+        if (/mobile|phone|contact/.test(h)) return "mobile";
+        if (/name/.test(h)) return "name";
+        if (/state/.test(h)) return "state";
+        if (/product/.test(h) && !/sub/.test(h)) return "product";
+        if (/sub.*product|company/.test(h)) return "sub_product"; // excel 'company' -> sub_product mapping
+        if (/vehicle.*type|bike|bikescooter|vehicle_type/.test(h)) return "vehicle_type";
+        if (/tc\b|tc /.test(h)) return "tc";
+        if (/fuel/.test(h)) return "fuel";
+        if (/rto|red\b|red /.test(h)) return "rto"; // RED / RTO mapping
+        // fallback mapping for date-like fields
+        if (/reg.*date|regdate/.test(h)) return "reg_date";
+        // catch generic prev_policy_type
+        if (/prev.*policy.*type|policy.*type/.test(h)) return "prev_policy_type";
+        // finally return normalized raw header as fallback (replace spaces with underscores)
+        return h.replace(/\s+/g, "_");
     };
-    const excelHeaders = rawData[0].map(h => String(h || "").toLowerCase().replace(/\s+/g, "_").replace(/\./g, ""));
+    // build header -> field map using first row
+    const excelHeaders = rawData[0];
+    const headerFieldMap = excelHeaders.map((h) => ({
+        raw: h,
+        field: mapHeaderToField(h),
+    }));
+    // rows to process
     const rows = rawData.slice(1);
+    // target DB columns (must match table schema)
+    const columns = ["state", "prev_policy_type", "product", "sub_product", "vehicle_type", "reg_no", "prev_insurer", "prev_policy_start_date", "prev_policy_end_date", "prev_pol_no", "prev_pol_premium", "rto", "reg_date", "name", "mobile", "vehicle_make", "vehicle_model_variant", "sale_amount", "engine_no", "chasis_no", "address", "tc", "fuel", "is_lead_type", "status", ];
     const values = [];
-    const inValidCount = 0;
-    const validCount = 0;
+    let invalidCount = 0;
+    let validCount = 0;
     for (const row of rows) {
-        if (!row || row.every(c => c === undefined || c === null || String(c).trim() === "")) continue;
+        if (!row || row.every((c) => c === undefined || c === null || String(c).trim() === "")) continue;
+        // build a canonical rowData object with keys = canonical fields
         const rowData = {};
-        excelHeaders.forEach((header, idx) => {
-            rowData[header] = row[idx] === undefined ? null : row[idx];
-        });
-        if (rowData["name"] != "" && rowData["reg_no"] != "" && rowData["mobile"] != "" && rowData["state"] != "" && rowData["prev_policy_end_date"] != "") {
-            values.push([
-                rowData["state"] || null,
-                rowData["prev_policy_type"] || null,
-                rowData["product"] || null,
-                rowData["company"] || null, // mapped as sub_product
-                rowData["vehicle_type"] || null,
-                rowData["reg_no"] || null,
-                rowData["prev_insurer"] || null,
-                rowData["prev_policy_start_date"] ? parseExcelDate(rowData["prev_policy_start_date"]) : null,
-                rowData["prev_policy_end_date"] ? parseExcelDate(rowData["prev_policy_end_date"]) : null,
-                rowData["prev_pol_no"] || null,
-                rowData["prev_pol_premium"] || null,
-                rowData["rto"] || null,
-                rowData["reg_date"] ? parseExcelDate(rowData["reg_date"]) : null,
-                rowData["name"] || null,
-                rowData["mobile"] || null,
-                rowData["vehicle_make"] || null,
-                rowData["vehicle_model_variant"] || null,
-                rowData["sale_amount"] || null,
-                rowData["engine_no"] || null,
-                rowData["chasis_no"] || null,
-                rowData["address"] || null,
-                rowData["tc"] || null,
-                rowData["fuel"] || null,
-                reqBody.lead_type,
-                0 // status default
-            ]);
-            validCount++;
-        } else {
-            inValidCount++;
+        for (let i = 0; i < headerFieldMap.length; i++) {
+            const hf = headerFieldMap[i];
+            const val = row[i] === undefined ? null : row[i];
+            // if field is already mapped to a canonical name, set it
+            const field = hf.field;
+            if (!field) continue;
+            rowData[field] = val;
         }
+        // Validate required
+        const hasRequired = rowData["name"] && rowData["reg_no"] && rowData["mobile"] && rowData["state"] && rowData["prev_policy_type"] && rowData["prev_policy_end_date"]; // allow Excel serial 0? mainly check presence
+        if (!hasRequired) {
+            invalidCount++;
+            continue;
+        }
+        // Parse date fields to MySQL date string (YYYY-MM-DD)
+        const prevPolicyStartDate = rowData["prev_policy_start_date"] ? parseExcelDate(rowData["prev_policy_start_date"]) : null;
+        const prevPolicyEndDate = rowData["prev_policy_end_date"] ? parseExcelDate(rowData["prev_policy_end_date"]) : null;
+        const regDate = rowData["reg_date"] ? parseExcelDate(rowData["reg_date"]) : null;
+        // For safety: convert numeric-looking RTO/RED to string
+        const rtoVal = rowData["rto"] !== undefined ? String(rowData["rto"]).trim() : null;
+        // build values aligned to columns array
+        const insertRow = [
+            rowData["state"] || null,
+            rowData["prev_policy_type"] || null,
+            rowData["product"] || null,
+            rowData["sub_product"] || rowData["company"] || null, // fallback
+            rowData["vehicle_type"] || null,
+            rowData["reg_no"] || null,
+            rowData["prev_insurer"] || null,
+            prevPolicyStartDate ? formatDateToMySQL(prevPolicyStartDate) : null,
+            prevPolicyEndDate ? formatDateToMySQL(prevPolicyEndDate) : null,
+            rowData["prev_pol_no"] || null,
+            rowData["prev_pol_premium"] || null,
+            rtoVal || null, // RED / RTO
+            regDate ? formatDateToMySQL(regDate) : null,
+            rowData["name"] || null,
+            rowData["mobile"] || null,
+            rowData["vehicle_make"] || null,
+            rowData["vehicle_model_variant"] || null,
+            rowData["sale_amount"] || null,
+            rowData["engine_no"] || null,
+            rowData["chasis_no"] || null,
+            rowData["address"] || null,
+            rowData["tc"] || null,
+            rowData["fuel"] || null,
+            reqBody.lead_type || null,
+            0, // status default
+        ];
+        values.push(insertRow);
+        validCount++;
     }
-    if (values.length === 0) {
+    const totalRows = rows.length;
+    if (!values.length) {
         return res.json({
+            status: true,
             message: "No valid rows to import",
-            count: 0
+            summary: {
+                total_rows: totalRows,
+                valid_rows: 0,
+                inserted_rows: 0,
+                duplicate_rows: 0,
+                invalid_rows: invalidCount,
+            },
         });
     }
-    const columns = ["state", "prev_policy_type", "product", "sub_product", "vehicle_type", "reg_no", "prev_insurer", "prev_policy_start_date", "prev_policy_end_date", "prev_pol_no", "prev_pol_premium", "rto", "reg_date", "name", "mobile", "vehicle_make", "vehicle_model_variant", "sale_amount", "engine_no", "chasis_no", "address", "tc", "fuel", "is_lead_type", "status"];
+    // --- Insert batches using INSERT IGNORE and UNIQUE constraint on (reg_no, prev_policy_type, prev_policy_end_date)
     const BATCH_SIZE = 500;
-    try {
-        for (let i = 0; i < values.length; i += BATCH_SIZE) {
-            const batch = values.slice(i, i + BATCH_SIZE);
-            const placeholdersPerRow = "(" + new Array(columns.length).fill("?").join(",") + ")";
-            const allPlaceholders = new Array(batch.length).fill(placeholdersPerRow).join(",");
-            const flatParams = [];
-            for (const r of batch) flatParams.push(...r);
-            const sql = `INSERT INTO temp_leads_management (${columns.join(",")}) VALUES ${allPlaceholders}`;
-            await ggBaseQuery(sql, flatParams);
+    let insertedCount = 0;
+    for (let i = 0; i < values.length; i += BATCH_SIZE) {
+        const batch = values.slice(i, i + BATCH_SIZE);
+        const placeholdersPerRow = "(" + new Array(columns.length).fill("?").join(",") + ")";
+        const allPlaceholders = new Array(batch.length).fill(placeholdersPerRow).join(",");
+        const flatParams = batch.flat();
+        const sql = `INSERT IGNORE INTO temp_leads_management (${columns.join(",")}) VALUES ${allPlaceholders}`;
+        try {
+            const result = await ggBaseQuery(sql, flatParams);
+            // result.affectedRows is number of rows actually inserted (MySQL)
+            insertedCount += result.affectedRows || 0;
+        } catch (err) {
+            console.error("Batch insert error:", err);
+            return res.status(500).json({
+                error: "DB insert error",
+                detail: err.message
+            });
         }
-        return res.json({
-            message: "File uploaded and processed successfully",
-            count: values.length,
-            valid_count: validCount,
-            invalid_count: inValidCount
-        });
-    } catch (error) {
-        console.log(error);
-        return res.status(500).json({
-            error: "Failed to process file",
-            detail: error.message
-        });
     }
+    const duplicateCount = validCount - insertedCount;
+    return res.json({
+        status: true,
+        message: "File processed successfully",
+        summary: {
+            total_rows: totalRows,
+            valid_rows: validCount,
+            inserted_rows: insertedCount,
+            duplicate_rows: duplicateCount,
+            invalid_rows: invalidCount,
+        },
+    });
 };
+// helper to produce MySQL date string
+function formatDateToMySQL(date) {
+    if (!(date instanceof Date) || isNaN(date)) return null;
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, "0");
+    const dd = String(date.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+}
 const fetchLeadsData = async (req, res) => {
     try {
         const {
@@ -1198,7 +1275,7 @@ const fetchLeadsData = async (req, res) => {
         if (rf) {
             conditions.push(`is_lead_type = '${rf.toString()}'`);
         }
-        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")} AND is_assigned =0` : "WHERE is_assigned =0";
         // 1. Distinct values
         const [leadDistinctValues] = await ggBaseQuery(`
       SELECT 
@@ -1206,20 +1283,22 @@ const fetchLeadsData = async (req, res) => {
         GROUP_CONCAT(DISTINCT prev_policy_type) AS prev_policy_types,
         GROUP_CONCAT(DISTINCT product) AS products,
         GROUP_CONCAT(DISTINCT sub_product) AS sub_products,
-        GROUP_CONCAT(DISTINCT vehicle_type) AS vehicle_types
+        GROUP_CONCAT(DISTINCT vehicle_type) AS vehicle_types,
+        GROUP_CONCAT(DISTINCT YEAR(prev_policy_end_date)) AS policy_years
+        
       FROM temp_leads_management
      
     `);
         // 2. Lead Type Counts (Fresh vs Renewal)
         const leadTypeCounts = await ggBaseQuery(`
-      SELECT status, COUNT(*) as total
+      SELECT is_assigned, COUNT(*) as total
       FROM temp_leads_management
       ${whereClause}
-      GROUP BY status
+      GROUP BY is_assigned
     `);
         const is_lead_type = {};
         (leadTypeCounts || []).forEach((r) => {
-            const key = r.status === 0 ? "Fresh" : "Renewal";
+            const key = r.is_assigned === 0 ? "Fresh" : "Renewal";
             is_lead_type[key] = r.total;
         });
         // 3. Policy End Year Counts
@@ -1236,25 +1315,25 @@ const fetchLeadsData = async (req, res) => {
         });
         // 4. Assigned vs Unassigned Counts
         const assignedCounts = await ggBaseQuery(`
-      SELECT status, COUNT(*) as total
+      SELECT is_assigned, COUNT(*) as total
       FROM temp_leads_management
-      WHERE status IN (0,1)
+      WHERE is_assigned IN (0,1)
       ${conditions.length ? `AND ${conditions.join(" AND ")}` : ""}
-      GROUP BY status
+      GROUP BY is_assigned
     `);
         const assigned_status = {
             Unassigned: 0,
             Assigned: 0
         };
         (assignedCounts || []).forEach((r) => {
-            if (r.status === 0) assigned_status.Unassigned = r.total;
-            if (r.status === 1) assigned_status.Assigned = r.total;
+            if (r.is_assigned === 0) assigned_status.Unassigned = r.total;
+            if (r.is_assigned === 1) assigned_status.Assigned = r.total;
         });
         // Work locations
         const work_locations = await ggBaseQuery(`
-      SELECT DISTINCT label 
-      FROM form_options 
-      WHERE category = 'place_of_posting'
+      SELECT id,name 
+      FROM teams 
+      WHERE status = 'active'
     `);
         // ✅ Filtered count (for frontend)
         const [filteredRow] = await ggBaseQuery(`
@@ -1269,8 +1348,11 @@ const fetchLeadsData = async (req, res) => {
             states: leadDistinctValues.states.split(",") || [],
             prev_policy_type: leadDistinctValues.prev_policy_types.split(",") || [],
             product: leadDistinctValues.products.split(",") || [],
-            sub_product: leadDistinctValues.sub_products.split(",") || [],
-            vehicle_type: leadDistinctValues.vehicle_types.split(",") || [],
+            policy_years: leadDistinctValues.policy_years.split(",") || [],
+            // sub_product: leadDistinctValues.sub_products.split(",") || [],
+            // vehicle_type: leadDistinctValues.vehicle_types.split(",") || [],
+            sub_product: [],
+            vehicle_type: [],
             is_lead_type,
             prev_policy_end_date,
             assigned_status,
@@ -1320,7 +1402,8 @@ const getTeamLeadByUsers = async (req, res) => {
             location
         } = req.query;
         // #FETCH LOCATOIN WISE USERS LITS
-        const team_leads = await ggBaseQuery(`SELECT id,name FROM users WHERE status = 1  AND designation ='Asst Mgr / Team Leader' AND place_of_posting = '${location}' `);
+        // const team_leads = await ggBaseQuery(`SELECT id,name FROM users WHERE status = 1  AND designation ='Asst Mgr / Team Leader' AND place_of_posting = '${location}' `);
+        const team_leads = await ggBaseQuery(`SELECT id,name FROM crm_users WHERE status = 1  AND role= 'team_lead'`);
         res.json({
             status: true,
             data: team_leads
@@ -1334,35 +1417,187 @@ const getTeamLeadByUsers = async (req, res) => {
         });
     }
 };
-const LeadAssigmentModule = async (req, res) => {
+const previewModuleReports = async (leads, selected_users, max_leads_per_employee, res) => {
+    try {
+        const MAX_LEADS_PER_EXEC = max_leads_per_employee || 150;
+        if (!leads.length) {
+            return res.status(400).json({
+                error: "No leads provided"
+            });
+        }
+        if (!selected_users || Object.keys(selected_users).length === 0) {
+            return res.status(400).json({
+                error: "selected_users object required"
+            });
+        }
+        // 1️⃣ Extract team names & build safe IN clause
+        const teamNames = Object.keys(selected_users).map((name) => name.trim());
+        const placeholders = teamNames.map(() => "?").join(", ");
+        // 2️⃣ Fetch team leads by name
+        const teamLeadsSql = `
+      SELECT id, name 
+      FROM teams
+      WHERE name IN (${placeholders}) AND status = 'active'
+    `;
+        const teamLeads = await ggBaseQuery(teamLeadsSql, teamNames);
+        if (!teamLeads.length) {
+            return res.status(404).json({
+                error: "No valid teams found"
+            });
+        }
+        // 3️⃣ Build mapping: team_name -> team_id
+        const teamIdByName = {};
+        for (const t of teamLeads) {
+            teamIdByName[t.name.trim()] = t.id;
+        }
+        // 4️⃣ Build executive list (each team’s members from selected_users)
+        const execByTeam = {};
+        for (const [teamName, userIds] of Object.entries(selected_users)) {
+            if (userIds && userIds.length) {
+                const teamId = teamIdByName[teamName.trim()];
+                if (!teamId) continue;
+                const userPlaceholders = userIds.map(() => "?").join(", ");
+                const execSql = `
+        SELECT u.id, u.name, ${teamId} AS leader_id
+        FROM users u
+        WHERE u.id IN (${userPlaceholders})
+        ORDER BY u.id ASC
+      `;
+                console.log(execSql, userIds);
+                const execRows = await ggBaseQuery(execSql, userIds);
+                execByTeam[teamId] = execRows.map((u) => ({ ...u,
+                    current_assigned: 0,
+                }));
+            }
+        }
+        if (!Object.keys(execByTeam).length) {
+            return res.status(404).json({
+                error: "No executives found under these team leads"
+            });
+        }
+        // 5️⃣ Create a global ordered flat list: TL1-E1, TL1-E2, TL2-E1, TL2-E2, ...
+        let flatExecList = [];
+        const maxTeamExecutives = Math.max(...Object.values(execByTeam).map((arr) => arr.length));
+        const teamIds = Object.keys(execByTeam);
+        for (let i = 0; i < maxTeamExecutives; i++) {
+            for (const tid of teamIds) {
+                const exec = execByTeam[tid][i];
+                if (exec) flatExecList.push(exec);
+            }
+        }
+        if (!flatExecList.length) {
+            return res.status(404).json({
+                error: "No executives available for assignment"
+            });
+        }
+        // 6️⃣ Round-robin assign leads
+        let execIndex = 0;
+        const totalLeads = leads.length;
+        const teamPreview = {};
+        const unassigned = [];
+        for (const leadId of leads) {
+            let assigned = false;
+            let attempts = 0;
+            while (attempts < flatExecList.length) {
+                const exec = flatExecList[execIndex];
+                const team_lead_id = exec.leader_id;
+                if (exec.current_assigned < MAX_LEADS_PER_EXEC) {
+                    if (!teamPreview[team_lead_id]) {
+                        teamPreview[team_lead_id] = {
+                            team_lead_id,
+                            executives: {},
+                            team_total: 0,
+                        };
+                    }
+                    if (!teamPreview[team_lead_id].executives[exec.id]) {
+                        teamPreview[team_lead_id].executives[exec.id] = {
+                            executive_id: exec.id,
+                            executive_name: exec.name,
+                            predicted_assign_count: 0,
+                        };
+                    }
+                    exec.current_assigned++;
+                    teamPreview[team_lead_id].executives[exec.id].predicted_assign_count++;
+                    teamPreview[team_lead_id].team_total++;
+                    assigned = true;
+                    break;
+                }
+                execIndex = (execIndex + 1) % flatExecList.length;
+                attempts++;
+            }
+            if (!assigned) unassigned.push(leadId);
+            execIndex = (execIndex + 1) % flatExecList.length;
+        }
+        // 7️⃣ Build preview summary
+        const preview_summary = teamLeads.map((lead) => {
+            const data = teamPreview[lead.id] || {
+                executives: {},
+                team_total: 0
+            };
+            return {
+                team_lead_id: lead.id,
+                team_lead_name: lead.name.trim(),
+                team_total: data.team_total,
+                executives: Object.values(data.executives),
+            };
+        });
+        // 8️⃣ Final output
+        const finalOut = {
+            status: true,
+            data: {
+                total: totalLeads,
+                assigned_total: totalLeads - unassigned.length,
+                unassigned_total: unassigned.length,
+                preview_summary,
+                unassigned_leads: unassigned,
+            },
+        };
+        return finalOut;
+    } catch (err) {
+        console.error("previewModuleReports error:", err);
+        return res.status(500).json({
+            error: "Server error",
+            detail: err.message
+        });
+    }
+};
+const LeadPreviewModule = async (req, res) => {
     try {
         const {
             filters,
-            year_filters
+            year_filters,
+            user_ids,
+            max_leads_per_employee,
+            is_preview,
+            selected_users
         } = req.body;
+        const userId = req.userId;
         if (!filters || !year_filters) {
             return res.status(400).json({
-                error: "Missing filters or year_filters"
+                error: "Missing filters or year_filters",
             });
         }
-        // 1️⃣ Base WHERE clauses (exclude "years")
+        // 1️⃣ Base WHERE clauses
         const baseClauses = [];
         if (filters.prev_policy_type.length) {
             baseClauses.push(`prev_policy_type IN (${filters.prev_policy_type
-          .map((v) => `'${v.replace("'", "''")}'`)
+          .map((v) => `'${v.replace(/'/g, "''")}'`)
           .join(",")})`);
         }
         if (filters.states.length) {
             baseClauses.push(`state IN (${filters.states
-          .map((v) => `'${v.replace("'", "''")}'`)
+          .map((v) => `'${v.replace(/'/g, "''")}'`)
           .join(",")})`);
         }
         if (filters.rf !== undefined && filters.rf !== null && filters.rf !== "") {
-            baseClauses.push(`is_lead_type = ${typeof filters.rf === "number" ? filters.rf : `'${filters.rf}'`}`);
+            baseClauses.push(`is_lead_type = ${
+          typeof filters.rf === "number" ? filters.rf : `'${filters.rf}'`
+        }`);
         }
         const baseWhere = baseClauses.length ? baseClauses.join(" AND ") : "1=1";
-        const finalRows = [];
-        // 2️⃣ Iterate over each year from year_filters
+        // ✅ Use an array, concat results in batches
+        let finalRows = [];
+        // 2️⃣ Iterate over year_filters
         for (const [yearStr, yrFilter] of Object.entries(year_filters)) {
             const year = parseInt(yearStr, 10);
             if (Number.isNaN(year)) continue;
@@ -1380,31 +1615,723 @@ const LeadAssigmentModule = async (req, res) => {
             const take = Math.floor(cnt * (percent / 100));
             if (take <= 0) continue;
             // 5️⃣ Select query
+            // const selectSql = `
+            //   SELECT id, reg_no, name, mobile, is_lead_type, prev_policy_end_date
+            //   FROM temp_leads_management
+            //   ${whereForYear}
+            //   ORDER BY prev_policy_end_date
+            //   LIMIT ${take};
+            // `;
             const selectSql = `
-        SELECT id,reg_no,name,mobile,is_lead_type,prev_policy_end_date
+        SELECT id
         FROM temp_leads_management
-        ${whereForYear}
-        ORDER BY prev_policy_end_date
+        ${whereForYear} AND is_assigned =0
+        ORDER BY prev_policy_end_date ASC
         LIMIT ${take};
       `;
+            console.log(selectSql);
             const rows = await ggBaseQuery(selectSql);
-            finalRows.push(...(rows || []));
+            // ✅ Avoid spread (...rows) which can blow stack on large arrays
+            if (rows && rows.length) {
+                for (const r of rows) {
+                    // shallow copy → strips DB driver prototypes/circular refs
+                    finalRows.push({ ...r
+                    });
+                }
+            }
         }
-        // 6️⃣ Return
-        return res.json({
-            total: finalRows.length,
-            leads: finalRows,
-        });
+        const thisLeads = finalRows.map(lead => lead.id);
+        if (!thisLeads || !thisLeads.length) {
+            return res.status(400).json({
+                error: "No leads provided"
+            });
+        }
+        const team_lead_ids = selected_users;
+        if (!team_lead_ids || !team_lead_ids.length) {
+            return res.status(400).json({
+                error: "team_lead_ids required"
+            });
+        }
+        let thisResponse = {};
+        if (is_preview) {
+            thisResponse = await previewModuleReports(thisLeads, team_lead_ids, max_leads_per_employee, res);
+        } else {
+            thisResponse = await assignLeadsModule(thisLeads, team_lead_ids, max_leads_per_employee, userId, res);
+        }
+        // 6️⃣ Return safe JSON
+        return res.json(thisResponse);
     } catch (err) {
         console.error("fetchFilteredLeadsAndSample error:", err);
         return res.status(500).json({
             error: "Server error",
+            detail: err.message,
+        });
+    }
+};
+const LeadTeamsPreviewModule = async (req, res) => {
+    try {
+        const {
+            filters,
+            year_filters,
+            user_ids,
+            max_leads_per_employee,
+            is_preview,
+            selected_users
+        } = req.body;
+        const userId = req.userId;
+        if (!filters || !year_filters) {
+            return res.status(400).json({
+                error: "Missing filters or year_filters",
+            });
+        }
+        // 1️⃣ Base WHERE clauses
+        const baseClauses = [];
+        if (filters.prev_policy_type.length) {
+            baseClauses.push(`prev_policy_type IN (${filters.prev_policy_type
+          .map((v) => `'${v.replace(/'/g, "''")}'`)
+          .join(",")})`);
+        }
+        if (filters.states.length) {
+            baseClauses.push(`state IN (${filters.states
+          .map((v) => `'${v.replace(/'/g, "''")}'`)
+          .join(",")})`);
+        }
+        if (filters.rf !== undefined && filters.rf !== null && filters.rf !== "") {
+            baseClauses.push(`is_lead_type = ${
+          typeof filters.rf === "number" ? filters.rf : `'${filters.rf}'`
+        }`);
+        }
+        const baseWhere = baseClauses.length ? baseClauses.join(" AND ") : "1=1";
+        // ✅ Use an array, concat results in batches
+        let finalRows = [];
+        // 2️⃣ Iterate over year_filters
+        for (const [yearStr, yrFilter] of Object.entries(year_filters)) {
+            const year = parseInt(yearStr, 10);
+            if (Number.isNaN(year)) continue;
+            const yearClauses = [baseWhere, `YEAR(prev_policy_end_date) = ${year}`];
+            if (yrFilter.start && yrFilter.end) {
+                yearClauses.push(`prev_policy_end_date BETWEEN '${yrFilter.start}' AND '${yrFilter.end}'`);
+            }
+            const whereForYear = `WHERE ${yearClauses.join(" AND ")}`;
+            // 3️⃣ Count query
+            const countSql = `SELECT COUNT(*) AS cnt FROM temp_leads_management ${whereForYear};`;
+            const countRes = await ggBaseQuery(countSql);
+            const cnt = countRes && countRes[0] && countRes[0].cnt ? Number(countRes[0].cnt) : 0;
+            // 4️⃣ Percent calc
+            const percent = Number(yrFilter.percent) || 100;
+            const take = Math.floor(cnt * (percent / 100));
+            if (take <= 0) continue;
+            // 5️⃣ Select query
+            // const selectSql = `
+            //   SELECT id, reg_no, name, mobile, is_lead_type, prev_policy_end_date
+            //   FROM temp_leads_management
+            //   ${whereForYear}
+            //   ORDER BY prev_policy_end_date
+            //   LIMIT ${take};
+            // `;
+            const selectSql = `
+        SELECT id
+        FROM temp_leads_management
+        ${whereForYear} AND is_assigned =0
+        ORDER BY prev_policy_end_date ASC
+        LIMIT ${take};
+      `;
+            console.log(selectSql);
+            const rows = await ggBaseQuery(selectSql);
+            // ✅ Avoid spread (...rows) which can blow stack on large arrays
+            if (rows && rows.length) {
+                for (const r of rows) {
+                    // shallow copy → strips DB driver prototypes/circular refs
+                    finalRows.push({ ...r
+                    });
+                }
+            }
+        }
+        const thisLeads = finalRows.map(lead => lead.id);
+        if (!thisLeads || !thisLeads.length) {
+            return res.status(400).json({
+                error: "No leads provided"
+            });
+        }
+        const team_lead_ids = selected_users;
+        if (!team_lead_ids || !Object.keys(team_lead_ids).length) {
+            return res.status(400).json({
+                error: "team_lead_ids required"
+            });
+        }
+        let thisResponse = {};
+        if (is_preview) {
+            thisResponse = await previewModuleReports(thisLeads, team_lead_ids, max_leads_per_employee, res);
+        } else {
+            thisResponse = await assignLeadsModule(thisLeads, team_lead_ids, max_leads_per_employee, userId, res);
+        }
+        // 6️⃣ Return safe JSON
+        return res.json(thisResponse);
+    } catch (err) {
+        console.error("fetchFilteredLeadsAndSample error:", err);
+        return res.status(500).json({
+            error: "Server error",
+            detail: err.message,
+        });
+    }
+};
+const assignLeadsModule = async (leads, team_lead_ids, max_leads_per_employee, user_id, res) => {
+    try {
+        const MAX_LEADS_PER_EXEC = max_leads_per_employee || 150;
+        if (!leads.length) {
+            return res.status(400).json({
+                error: "No leads provided"
+            });
+        }
+        if (!team_lead_ids.length) {
+            return res.status(400).json({
+                error: "team_lead_ids required"
+            });
+        }
+        // 🔹 Build team placeholders
+        const placeholders = team_lead_ids.map((id) => `${id}`).join(",");
+        // 1️⃣ Fetch team leads
+        const teamLeads = await ggBaseQuery(`
+     SELECT id, name 
+      FROM teams  
+      WHERE id IN (${placeholders}) AND status = 'active'
+    `);
+        // 2️⃣ Fetch executives
+        const executives = await ggBaseQuery(`
+      SELECT u.id,u.name,tm.team_id as leader_id
+      FROM team_members tm
+LEFT JOIN users u ON u.id = tm.user_id
+            WHERE tm.team_id IN (${placeholders}) 
+      ORDER BY tm.team_id, u.id ASC
+    `);
+        // 3️⃣ Prepare executive mapping
+        const execByTeam = {};
+        for (const exec of executives) {
+            if (!execByTeam[exec.leader_id]) execByTeam[exec.leader_id] = [];
+            execByTeam[exec.leader_id].push({ ...exec,
+                current_assigned: 0
+            });
+        }
+        // Flatten in round-robin order (TL1-E1, TL2-E1, TL1-E2, TL2-E2...)
+        let flatExecList = [];
+        const maxTeamExecutives = Math.max(...Object.values(execByTeam).map((arr) => arr.length));
+        for (let i = 0; i < maxTeamExecutives; i++) {
+            for (const tid of team_lead_ids) {
+                const exec = execByTeam[tid][i];
+                if (exec) flatExecList.push(exec);
+            }
+        }
+        if (!flatExecList.length) {
+            return res.status(404).json({
+                error: "No executives available"
+            });
+        }
+        // 4️⃣ Round-robin assignment
+        let execIndex = 0;
+        const totalLeads = leads.length;
+        const unassigned = [];
+        for (const leadId of leads) {
+            let assigned = false;
+            let attempts = 0;
+            while (attempts < flatExecList.length) {
+                const exec = flatExecList[execIndex];
+                const team_lead_id = exec.leader_id;
+                if (exec.current_assigned < MAX_LEADS_PER_EXEC) {
+                    // ✅ Full insert with TEAMLEADER, EXECUTIVE, status, sub_status
+                    await ggBaseQuery(`
+            INSERT INTO insurdata (
+              BIKESCOOTER, COMPANY, REGNO, REGDATE, TC, fuel, RED, PREVINS, PREVPOL_NO,
+              NAME, ADDRESS, ENGINE_NO, CHASIS_NO, VEHICLEMAKE, VEHICLEMODEL, VARIANT,
+              SALE_AMOUNT, MOBILE, TEAMLEADER, EXECUTIVE, CURSTATUS, RESPONSE, LATTERDATE,
+              REMARKS, status, sub_status, state, prev_policy_type, product, sub_product,
+              created_at, updated_at, status_history
+            )
+            SELECT
+              vehicle_type, prev_insurer, reg_no, reg_date, tc, fuel, rto, prev_insurer, prev_pol_no,
+              name, address, engine_no, chasis_no, vehicle_make, vehicle_model_variant, vehicle_model_variant,
+              sale_amount, mobile,
+              ? AS TEAMLEADER,
+              ? AS EXECUTIVE,
+              'New' AS CURSTATUS,
+              NULL AS RESPONSE,
+              NULL AS LATTERDATE,
+              NULL AS REMARKS,
+              1 AS status,
+              0 AS sub_status,
+              state,
+              prev_policy_type,
+              product,
+              sub_product,
+              NOW() AS created_at,
+              NOW() AS updated_at,
+              JSON_OBJECT('status', 'New', 'date', NOW()) AS status_history
+            FROM temp_leads_management
+            WHERE id = ?
+          `, [team_lead_id, exec.id, leadId]);
+                    // ✅ Update temp_leads_management tracking
+                    await ggBaseQuery(`
+            UPDATE temp_leads_management
+            SET is_assigned = 1,
+                executive_id = ?,
+                assigned_by = ?,
+                assigned_at = NOW()
+            WHERE id = ?
+          `, [exec.id, team_lead_id, user_id, leadId]);
+                    // ✅ Insert into logs
+                    await ggBaseQuery(`
+            INSERT INTO lead_assignment_logs (
+              lead_id, team_lead_id, executive_id, assigned_by, assigned_at, remarks
+            )
+            VALUES (?, ?, ?, ?, NOW(), ?)
+          `, [leadId, team_lead_id, exec.id, user_id, 'Initial lead assignment']);
+                    exec.current_assigned++;
+                    assigned = true;
+                    break;
+                }
+                execIndex = (execIndex + 1) % flatExecList.length;
+                attempts++;
+            }
+            if (!assigned) unassigned.push(leadId);
+            execIndex = (execIndex + 1) % flatExecList.length;
+        }
+        // ✅ Done
+        return res.json({
+            status: true,
+            message: "Leads assigned successfully",
+            data: {
+                total: totalLeads,
+                unassigned_total: unassigned.length,
+                unassigned_leads: unassigned,
+            },
+        });
+    } catch (err) {
+        console.error("assignLeadsModule error:", err);
+        return res.status(500).json({
+            error: "Server error",
+            detail: err.message,
+        });
+    }
+};
+const getExecutiveCcount = async (req, res) => {
+    try {
+        const {
+            team_leads
+        } = req.body;
+        if (!team_leads.length) {
+            return res.json({
+                status: true,
+                data: [],
+            });
+        }
+        const placeholders = team_leads.map((id) => `${id}`).join(",");
+        const execSql = `
+      SELECT COUNT(id) as count
+      FROM crm_users 
+      WHERE leader_id IN (${placeholders}) AND role = 'executive'
+      ORDER BY leader_id, id ASC
+    `;
+        const executives = await ggBaseQuery(execSql);
+        return res.json({
+            status: true,
+            data: executives[0]['count'],
+        });
+    } catch (err) {
+        console.error("Error fetching filters:", err);
+        res.json({
+            status: false,
+            error: "Failed to fetch users",
+            detail: err.message,
+        });
+    }
+};
+const getTeamExecutives = async (req, res) => {
+    try {
+        const {
+            team_leads
+        } = req.body;
+        if (!team_leads.length) {
+            return res.json({
+                status: true,
+                data: [],
+            });
+        }
+        const placeholders = team_leads.map((id) => `${id}`).join(",");
+        const execSql = `
+      
+
+
+            SELECT COUNT(id) as count
+      FROM team_members 
+      WHERE team_id IN (${placeholders})
+
+    `;
+        const executives = await ggBaseQuery(execSql);
+        return res.json({
+            status: true,
+            data: executives[0]['count'],
+        });
+    } catch (err) {
+        console.error("Error fetching filters:", err);
+        res.json({
+            status: false,
+            error: "Failed to fetch users",
+            detail: err.message,
+        });
+    }
+};
+async function listTeams(req, res) {
+    try {
+        const {
+            page = 1,
+                pageSize = 20,
+                q,
+                location,
+                vertical,
+                status
+        } = req.body || req.query;
+        const offset = (page - 1) * pageSize;
+        let where = "WHERE t.deleted_at IS NULL";
+        const params = [];
+        // 🔍 Search filter
+        if (q) {
+            where += " AND t.name LIKE ?";
+            params.push(`%${q}%`);
+        }
+        // 📍 Location filter (multi or single)
+        if (Array.isArray(location) && location.length > 0) {
+            where += ` AND t.location IN (${location.map(() => "?").join(",")})`;
+            params.push(...location);
+        } else if (typeof location === "string" && location.trim() !== "") {
+            where += " AND t.location = ?";
+            params.push(location);
+        }
+        // 🏢 Vertical filter (multi or single)
+        if (Array.isArray(vertical) && vertical.length > 0) {
+            where += ` AND t.vertical IN (${vertical.map(() => "?").join(",")})`;
+            params.push(...vertical);
+        } else if (typeof vertical === "string" && vertical.trim() !== "") {
+            where += " AND t.vertical = ?";
+            params.push(vertical);
+        }
+        // ✅ Status filter
+        if (status) {
+            where += " AND t.status = ?";
+            params.push(status);
+        }
+        // 🧮 Total count
+        const [countRows] = await ggBaseQuery(`SELECT COUNT(DISTINCT t.id) AS cnt 
+       FROM teams t
+       LEFT JOIN team_members tm ON tm.team_id = t.id
+       ${where}`, params);
+        const total = countRows[0] && countRows[0].cnt || 0;
+        // 📊 Team list with member count
+        const teamQuery = `
+      SELECT 
+        t.*,
+        COUNT(tm.id) AS member_count,
+    JSON_ARRAYAGG(
+       
+        JSON_OBJECT(
+            'name', u.name,
+            'id', u.id
+        )
+    ) AS member_data,
+        GROUP_CONCAT(u.name ORDER BY u.name SEPARATOR ', ') AS member_names
+      FROM teams t
+      LEFT JOIN team_members tm ON tm.team_id = t.id
+      LEFT JOIN users u ON u.id = tm.user_id
+      ${where}
+      GROUP BY t.id
+      ORDER BY t.created_at DESC
+      LIMIT ${Number(pageSize)} OFFSET ${Number(offset)}
+    `;
+        // ✅ Here we embed limit/offset as literals (safe since they’re sanitized)
+        const teams = await ggBaseQuery(teamQuery, params);
+        res.json({
+            total,
+            page: Number(page),
+            pageSize: Number(pageSize),
+            teams,
+        });
+    } catch (err) {
+        console.error("listTeams error:", err);
+        res.status(500).json({
+            error: "Server error",
+            detail: err.message,
+        });
+    }
+}
+// =====================
+// GET /api/teams/:id
+// =====================
+async function getTeam(req, res) {
+    try {
+        const {
+            id
+        } = req.params;
+        const [teamRows] = await ggBaseQuery(`SELECT * FROM teams WHERE id = ? AND deleted_at IS NULL LIMIT 1`, [id]);
+        const team = teamRows[0];
+        if (!team) return res.status(404).json({
+            error: "Team not found"
+        });
+        const [members] = await ggBaseQuery(`SELECT u.id, u.name, u.email 
+         FROM team_members tm
+         INNER JOIN users u ON tm.user_id = u.id
+        WHERE tm.team_id = ?`, [id]);
+        team.members = members;
+        res.json(team);
+    } catch (err) {
+        console.error("getTeam error:", err);
+        res.status(500).json({
+            error: "Server error",
             detail: err.message
+        });
+    }
+}
+// =====================
+// POST /api/teams
+// =====================
+async function createTeam(req, res) {
+    try {
+        // 🧩 Auth user check
+        const userId = req.user ? req.user.id : 0;
+        // 🧠 Extract from request
+        const body = req.body ? req.body : {};
+        const name = body.name;
+        const location = body.location;
+        const vertical = body.vertical;
+        const status = body.status ? body.status : "active";
+        const members = Array.isArray(body.members) ? body.members : [];
+        // ✅ Validation
+        if (!name) {
+            return res.status(400).json({
+                error: "Team name required"
+            });
+        }
+        // 📍 Convert arrays (multi-select) to string
+        const locationStr = Array.isArray(location) ? location.join(",") : location;
+        const verticalStr = Array.isArray(vertical) ? vertical.join(",") : vertical;
+        // ✅ 1️⃣ Insert into teams table
+        const insertSQL = `
+      INSERT INTO teams (name, location, vertical, status)
+      VALUES (?, ?, ?, ?)
+    `;
+        const insertParams = [name, locationStr, verticalStr, status];
+        const resultArr = await ggBaseQuery(insertSQL, insertParams);
+        // ⚙️ Extract team ID
+        var insertResult = resultArr && resultArr[0] ? resultArr[0] : resultArr;
+        const teamId = insertResult && insertResult.insertId ? insertResult.insertId : 0;
+        if (!teamId) {
+            throw new Error("Failed to retrieve inserted team ID");
+        }
+        // ✅ 2️⃣ Insert team members one by one (safe)
+        if (members.length > 0) {
+            for (var i = 0; i < members.length; i++) {
+                var uid = members[i];
+                await ggBaseQuery("INSERT IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)", [teamId, uid]);
+            }
+        }
+        // ✅ 3️⃣ Fetch created team details
+        const teamRowsArr = await ggBaseQuery("SELECT * FROM teams WHERE id = ?", [
+            teamId,
+        ]);
+        const teamRows = teamRowsArr && teamRowsArr[0] ? teamRowsArr[0] : teamRowsArr;
+        const team = teamRows && teamRows[0] ? teamRows[0] : (Array.isArray(teamRows) ? {} : teamRows);
+        // ✅ 4️⃣ Fetch member names
+        const memberListArr = await ggBaseQuery("SELECT u.id, u.name FROM team_members tm INNER JOIN users u ON u.id = tm.user_id WHERE tm.team_id = ?", [teamId]);
+        const memberList = memberListArr;
+        team.members = memberList ? memberList : [];
+        // ✅ Final Response
+        res.status(201).json({
+            success: true,
+            message: "Team created successfully",
+            team: team,
+        });
+    } catch (err) {
+        console.error("createTeam error:", err);
+        res.status(500).json({
+            error: "Failed to create team",
+            detail: err.message,
+        });
+    }
+}
+// =====================
+// PUT /api/teams/:id
+// =====================
+async function updateTeam(req, res) {
+    try {
+        // const {
+        //     id
+        // } = req.params;
+        const userId = req.user.id;
+        const {
+            id,
+            name,
+            location,
+            vertical,
+            status,
+            members
+        } = req.body;
+        // 1️⃣ Update team basic info
+        await ggBaseQuery(`UPDATE teams
+       SET name = ?, location = ?, vertical = ?, status = ?,updated_at = ?
+       WHERE id = ?`, [name, location.join(","), vertical.join(","), status, moment().format("YYYY-MM-DD HH:mm:ss"), id]);
+        // 2️⃣ Replace members
+        if (Array.isArray(members)) {
+            await ggBaseQuery(`DELETE FROM team_members WHERE team_id = ?`, [id]);
+            if (members.length > 0) {
+                for (var i = 0; i < members.length; i++) {
+                    var uid = members[i];
+                    await ggBaseQuery("INSERT IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)", [id, uid]);
+                }
+            }
+        }
+        const [teamRows] = await ggBaseQuery(`SELECT * FROM teams WHERE id = ?`, [id]);
+        res.json(teamRows[0]);
+    } catch (err) {
+        console.error("updateTeam error:", err);
+        res.status(500).json({
+            error: "Failed to update team",
+            detail: err.message
+        });
+    } finally {}
+}
+// =====================
+// DELETE /api/teams/:id
+// =====================
+async function deleteTeam(req, res) {
+    try {
+        const {
+            id
+        } = req.body;
+        const userId = req.user.id;
+        await ggBaseQuery(`DELETE FROM teams WHERE id = ?`, [id]);
+        res.json({
+            success: true
+        });
+    } catch (err) {
+        console.error("deleteTeam error:", err);
+        res.status(500).json({
+            error: "Failed to delete team",
+            detail: err.message
+        });
+    }
+}
+const getUserListWithOptions = async (req, res) => {
+    try {
+        // ✅ Support both query params and JSON body
+        const filters = req.body.filters || {};
+        const {
+            locations = [], verticals = []
+        } = filters;
+        // 🔹 Base query
+        let sql = `SELECT id, name, place_of_posting, vertical FROM users WHERE role NOT IN ('admin', 'super') AND status = 1`;
+        const params = [];
+        // 🔸 Apply filters dynamically
+        if (locations.length > 0) {
+            const placeholders = locations.map(() => "?").join(", ");
+            sql += ` AND place_of_posting IN (${placeholders})`;
+            params.push(...locations);
+        }
+        if (verticals.length > 0) {
+            const placeholders = verticals.map(() => "?").join(", ");
+            sql += ` AND vertical IN (${placeholders})`;
+            params.push(...verticals);
+        }
+        // 🔹 Execute SQL
+        const work_location_users = await ggBaseQuery(sql, params);
+        // 🔹 Fetch dropdowns (verticals, locations)
+        const getGlobalOptionsData = await getGlobalOptions();
+        // ✅ Final response
+        res.json({
+            status: true,
+            data: work_location_users || [],
+            ...getGlobalOptionsData,
+        });
+    } catch (err) {
+        console.error("Error fetching user list:", err);
+        res.json({
+            status: false,
+            error: "Failed to fetch users",
+            detail: err.message,
+        });
+    }
+};
+// const getTeamLeadByUsers = async (req, res) => {
+//     try {
+//         const {
+//             location
+//         } = req.query;
+//         // #FETCH LOCATOIN WISE USERS LITS
+//         // const team_leads = await ggBaseQuery(`SELECT id,name FROM users WHERE status = 1  AND designation ='Asst Mgr / Team Leader' AND place_of_posting = '${location}' `);
+//         const team_leads = await ggBaseQuery(`SELECT id,name FROM crm_users WHERE status = 1  AND role= 'team_lead'`);
+//         res.json({
+//             status: true,
+//             data: team_leads
+//         })
+//     } catch (err) {
+//         console.error("Error fetching filters:", err);
+//         res.json({
+//             status: false,
+//             error: "Failed to fetch users",
+//             detail: err.message,
+//         });
+//     }
+// };
+const getLocationByTeams = async (req, res) => {
+    try {
+        const {
+            location
+        } = req.query;
+        // #FETCH LOCATOIN WISE USERS LITS
+        const team_leads = await ggBaseQuery(`SELECT id,name FROM teams where status='active' AND  FIND_IN_SET(?, location) > 0`, [location]);
+        res.json({
+            status: true,
+            data: team_leads
+        })
+    } catch (err) {
+        console.error("Error fetching filters:", err);
+        res.json({
+            status: false,
+            error: "Failed to fetch users",
+            detail: err.message,
+        });
+    }
+};
+const getTeamByMember = async (req, res) => {
+    try {
+        const {
+            location
+        } = req.query;
+        // #FETCH LOCATOIN WISE USERS LITS
+        const team_members = await ggBaseQuery(`SELECT us.name,tm.user_id as id FROM team_members tm  LEFT JOIN  users us ON us.id = tm.user_id  WHERE tm.team_id = ?  ORDER BY us.name ASC`, [location]);
+        res.json({
+            status: true,
+            data: team_members
+        });
+    } catch (err) {
+        console.error("Error fetching filters:", err);
+        res.json({
+            status: false,
+            error: "Failed to fetch users",
+            detail: err.message,
         });
     }
 };
 export default {
-    LeadAssigmentModule,
+    getTeamByMember,
+    LeadTeamsPreviewModule,
+    getTeamExecutives,
+    getLocationByTeams,
+    getUserListWithOptions,
+    listTeams,
+    getTeam,
+    createTeam,
+    updateTeam,
+    deleteTeam,
+    getExecutiveCcount,
+    assignLeadsModule,
+    LeadPreviewModule,
     getTeamLeadByUsers,
     getLocationByUsers,
     fetchLeadsData,

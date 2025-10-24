@@ -19,6 +19,7 @@ const auth = (req, res, next) => {
         const {
             userId
         } = decode;
+        req.userId = userId;
         console.log(`${req.method} | ${(userId || userId)}   =>   ${req.originalUrl} `);
         next();
     } catch (err) {

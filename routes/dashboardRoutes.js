@@ -9,7 +9,29 @@ router.post('/leads/import', auth,dashBoardController.leadsImport);
 router.get('/leads/fetch', auth,dashBoardController.fetchLeadsData);
 router.get('/user_location', auth,dashBoardController.getLocationByUsers);
 router.get('/teamlead_by_location', auth,dashBoardController.getTeamLeadByUsers);
-router.post('/leads/assign', auth,dashBoardController.LeadAssigmentModule);
+
+
+router.post('/executive_count', auth,dashBoardController.getTeamExecutives);
+
+
+router.post('/leads/preview', auth,dashBoardController.LeadTeamsPreviewModule);
+router.post('/leads/assign', auth,dashBoardController.assignLeadsModule);
+
+
+// Teams VIEW
+
+router.get('/location_by_teams', auth,dashBoardController.getLocationByTeams);
+
+router.get('/team_by_member', auth,dashBoardController.getTeamByMember);
+
+router.post('/users_list',auth,dashBoardController.getUserListWithOptions);
+
+router.post('/teams/list',auth,dashBoardController.listTeams);
+router.post('/get_team',auth,dashBoardController.getTeam);
+router.post('/teams/create',auth,dashBoardController.createTeam);
+router.post('/teams/update',auth,dashBoardController.updateTeam);
+router.post('/teams/delete',auth,dashBoardController.deleteTeam);
+
 
 // # MIS _CRM_ MIGRATION
 
