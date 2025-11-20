@@ -324,31 +324,33 @@ const login = async (req, res) => {
         console.log(req.body);
         // Find the user by phone
         const [user] = await ggBaseQuery(`SELECT
-    id,
-    name,
+    us.id,
+    us.name,
     (
         SELECT CONCAT('${BASE_URL}','',d.document_path) 
         FROM documents d
         WHERE d.ref_id = us.id AND  d.document_type = 'avatarImage'
         LIMIT 1
     ) AS avatar_url,
-    email_address,
-    phone,
-    password,
-    work_location,
-    role,
-    is_deleted,
-    is_new,
-    vertical,
-    grade,
-    designation,
-    monthly_target,
-    place_of_posting,
-    created_at
+    us.email_address,
+    us.phone,
+    us.password,
+    us.work_location,
+    r.name as role,
+    us.is_deleted,
+    us.is_new,
+    us.vertical,
+    us.grade,
+    us.designation,
+    us.monthly_target,
+    us.place_of_posting,
+    us.created_at
 
-FROM
-    users us where 
-email_address =? 
+FROM users us 
+join user_roles ur on ur.user_id = us.id
+join roles r on r.id = ur.role_id
+where us.email_address =? 
+
 `, [username]);
         console.log(user);
         // Compare the provided password with the hashed password stored in the database
@@ -411,7 +413,7 @@ email_address =?
                 "crm_token":crm_token,
                 "name": user.name,
                 "monthly_target":user.monthly_target,
-                "role": (user.designation === 'Asst Mgr / Team Leader' ? 'team_lead' : user.role),
+                "role": (['Team_Lead_Operations','Team_Lead_TeleCaller' ].includes(user.role)? 'team_lead' : (user.role === 'telecaller' ? 'agent' : user.role)),
                 "vertical": user.vertical,
                 "grade": user.grade,
                 "plan": "free",

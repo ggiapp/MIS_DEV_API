@@ -5,13 +5,13 @@ const path = require('path');
 // const DB_NAME = "ggi_dev_mis_base";
 
 // # SEP62025 - DEV CRM MIGRATION
-const DB_NAME = "development_ggi_mis_base";
+const DB_NAME = process.env.DB_NAME || "development_ggi_mis_base";
 
 // Create a MySQL connection pool
 const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: 'TOi@Dz,WaLBQ',
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
   database: DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
@@ -25,7 +25,7 @@ const  ggBaseQuery = async (query, params = []) => {
 };
 
 
-const JWT_SECRET ="ggindia2025@co.in";
+const JWT_SECRET = process.env.JWT_SECRET || "ggindia2025@co.in";
 
 
 const uploadBasePath = "./uploads/";

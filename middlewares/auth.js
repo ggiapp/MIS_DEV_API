@@ -4,15 +4,21 @@ import {
 }
 from "./../db/connectdb";
 const auth = (req, res, next) => {
-    const token = req.headers.authorization;
-    if (!token) {
-        res.status(401).json({
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        return res.status(401).json({
             status: false,
             code: false,
             authToken: false,
             message: "Authentication failed , Token missing"
         });
     }
+    
+    // Extract token from "Bearer <token>" format or use raw token
+    const token = authHeader.startsWith('Bearer ') 
+        ? authHeader.slice(7) 
+        : authHeader;
+    
     try {
         const decode = jwt.verify(token, JWT_SECRET)
         req.user = decode;

@@ -50,56 +50,100 @@ const getSiteSettings = async (columnName) => {
     let [optionsRows] = await ggBaseQuery(thisOptionsQuery);
     return optionsRows;
 }
+// Helper function to sanitize folder name from document type
+const sanitizeFolderName = (documentType) => {
+    if (!documentType) {
+        return 'other';
+    }
+    // Convert to lowercase, replace spaces with underscores, remove special characters
+    return documentType
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, '_')
+        .replace(/[^a-z0-9_]/g, '')
+        .replace(/_+/g, '_')
+        .replace(/^_|_$/g, '') || 'other';
+};
+
 // Function to handle file uploads
 const docUploader = async (req, files, modulePath) => {
     const ggDocument = files;
-    // console.log(ggDocument["document[0][file]"]);
     const reqBody = req.body;
-    const {
-        userId
-    } = req.user;
-    // console.log(reqBody);
+    const { userId } = req.user;
+
+    // Determine document count safely
+    const rawDocCount = reqBody.doc_count != null ? reqBody.doc_count : reqBody.docCount;
+    const docCount = Number(rawDocCount);
+
+    if (!Number.isInteger(docCount) || docCount <= 0) {
+        throw new Error("Invalid document count supplied.");
+    }
+
+    // Collect document types from request body
     const documentTypes = [];
-    // Iterate through the keys of reqBody
     for (const key in reqBody) {
-        if (reqBody.hasOwnProperty(key)) {
-            // Check if the key matches the pattern 'document[i][type]'
+        if (Object.prototype.hasOwnProperty.call(reqBody, key)) {
             const match = key.match(/^document\[(\d+)\]\[type\]$/);
             if (match) {
-                const index = match[1];
+                const index = Number(match[1]);
                 documentTypes[index] = reqBody[key];
             }
         }
     }
-    // Iterate based on the provided doc_count
-    for (let i = 0; i < parseInt(reqBody.doc_count); i++) {
-        const thisFile = ggDocument[`document[${i}][file]`];
-        const thisType = documentTypes[i];
-        const timestamp = new Date().getTime();
+
+    for (let i = 0; i < docCount; i++) {
+        const fileKey = `document[${i}][file]`;
+        let thisFile = ggDocument[fileKey];
+
+        if (!thisFile) {
+            console.warn(`File not found for key ${fileKey}, skipping.`);
+            continue;
+        }
+
+        // express-fileupload may provide an array when multiple files share the same field name
+        if (Array.isArray(thisFile) && thisFile.length > 0) {
+            thisFile = thisFile[0];
+        }
+
+        const thisType = documentTypes[i] || null;
+        
+        // Create folder name based on document type
+        const folderName = sanitizeFolderName(thisType);
+        const documentFolderPath = path.join(modulePath, folderName);
+        
+        const timestamp = Date.now();
         const ext = path.extname(thisFile.name);
         const fileName = `${timestamp}${ext}`;
         const replacePath = replaceBasePath;
-        let filePath = path.join(replacePath, modulePath, fileName);
-        await ensureDirectoryExists(path.join(replacePath, uploadBasePath));
-        thisFile.mv(filePath);
+        let filePath = path.join(replacePath, documentFolderPath, fileName);
+
+        // Ensure the document type folder exists
+        await ensureDirectoryExists(path.join(replacePath, documentFolderPath));
+
+        await new Promise((resolve, reject) => {
+            thisFile.mv(filePath, (err) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve();
+                }
+            });
+        });
+
         filePath = filePath.replace(replacePath, "");
-        console.log(i + " ::=> " + filePath);
-        // Assuming `ggBaseQuery` is a function that executes the SQL query
-        const insertQuery = 'INSERT INTO documents (document_path, document_type, type, ref_id, user_id, created_at) VALUES (?, ?, ?, ?, ?, NOW())';
+
+        const insertQuery =
+            "INSERT INTO documents (document_path, document_type, type, ref_id, user_id, created_at) VALUES (?, ?, ?, ?, ?, NOW())";
         const insertValues = [filePath, thisType, req.module, req.ref_id, userId];
-        console.log(insertValues)
+
         try {
-            // Execute the query
             await ggBaseQuery(insertQuery, insertValues);
-            // Move the file to the destination (uncomment this line when you are ready)
-            // await thisFile.mv(filePath);
-            console.log(`File inserted successfully: ${filePath}`);
         } catch (error) {
-            console.error(`Error inserting file: ${error.message}`);
-            // Handle the error accordingly
+            console.error(`Error inserting document record: ${error.message}`);
+            throw error;
         }
     }
-}
+};
 const index = async (req, res) => {
     console.log(req.user);
     try {
@@ -416,10 +460,528 @@ const deleteItem = async (req, res) => {
         });
     }
 };
+
+const recordsview = async (req, res) => {
+    try {
+      const { userId } = req.user;
+      
+      if (!userId) {
+        return res.status(400).json({
+          status: false,
+          message: "Missing user ID.",
+        });
+      }
+
+      // Get user role from users table
+      const userRole = await ggBaseQuery(`
+        SELECT r.name as role
+        FROM users u
+        join user_roles ur on ur.user_id = u.id
+        join roles r on r.id = ur.role_id
+        WHERE u.id = ?
+      `, [userId]);
+      const role = userRole && userRole.length > 0 && userRole[0].role ? userRole[0].role : null;
+      console.log('Role:',role);
+     
+      // Pagination - read from request body (POST) or query (fallback)
+      const pageCount = Number(req.body.pagecount || req.body.pageCount || req.query.pagecount) || 20;
+      const page = Number(req.body.page || req.query.page) || 1;
+      const offset = (page - 1) * pageCount;
+  
+      // Default sort by RED date
+      const sort = req.body.sort || req.query.sort || "RED";
+      const sortBy = req.body.sortby || req.body.sortBy || req.query.sortby || "DESC";
+
+      // Validate to prevent SQL injection
+      const validSortColumn = /^[a-zA-Z0-9_]+$/.test(sort)
+        ? sort
+        : "RED";
+      const validSortBy = sortBy.toUpperCase() === "DESC" ? "DESC" : "ASC";
+  
+      // Build WHERE clause based on user role and optional status filter
+      const whereConditions = [];
+      const whereParams = [];
+
+      // If agent, show only records where user is TEAMLEADER or EXECUTIVE
+      if (role === "agent") {
+        whereConditions.push(`(i.TEAMLEADER = ? OR i.EXECUTIVE = ?)`);
+        whereParams.push(userId, userId);
+      }
+
+      // If operation, show only records with statuses: Confirmed, Policy issued, and Closed_QCpass
+      if (role === "operations") {
+        const operationStatuses = await ggBaseQuery(`
+          SELECT id FROM statuses 
+          WHERE LOWER(name) IN ('confirmed', 'policy issued', 'closed_qcpass') AND is_active = 1
+        `);
+        
+        if (operationStatuses && operationStatuses.length > 0) {
+          const statusIds = operationStatuses.map(s => s.id);
+          const placeholders = statusIds.map(() => '?').join(',');
+          whereConditions.push(`i.status IN (${placeholders})`);
+          whereParams.push(...statusIds);
+        } else {
+          // If no matching statuses found, return empty result
+          whereConditions.push(`1 = 0`);
+        }
+      }
+
+      // Optional status filter from body or query
+      const statusId = req.body.statusId || req.body.status_id || req.query.statusId || req.query.status_id;
+      if (statusId) {
+        whereConditions.push(`i.status = ?`);
+        whereParams.push(statusId);
+      }
+
+      const whereClause = whereConditions.length ? `WHERE ${whereConditions.join(" AND ")}` : ``;
+
+      // Count total records with role-based filtering
+      const countQuery = `SELECT COUNT(*) AS total FROM insurdata i ${whereClause}`;
+      const countResult = await ggBaseQuery(countQuery, whereParams);
+      const total = countResult && countResult.length > 0 ? countResult[0].total || 0 : 0;
+
+      // Query with team leader and executive names from crm_users table
+      // If sorting by RED, convert date format for proper sorting
+      const orderByClause = validSortColumn === 'RED' 
+        ? `ORDER BY STR_TO_DATE(i.RED, '%d-%m-%Y') ${validSortBy}`
+        : `ORDER BY i.\`${validSortColumn}\` ${validSortBy}`;
+      
+      const query = `
+        SELECT 
+          i.*,
+          u.name AS TEAMLEADER,
+          u2.name AS EXECUTIVE,
+          s.name AS status_name,
+          ss.name AS sub_status_name
+        FROM insurdata i
+        LEFT JOIN statuses s ON i.status = s.id
+        LEFT JOIN substatuses ss ON i.sub_status = ss.id
+        LEFT JOIN users u ON i.TEAMLEADER = u.id
+        LEFT JOIN users u2 ON i.EXECUTIVE = u2.id
+        ${whereClause}
+        ${orderByClause}
+        LIMIT ${Number(pageCount)} OFFSET ${Number(offset)}
+      `;
+      
+      const data = await ggBaseQuery(query, whereParams);
+
+      // Attach documents for each record by matching insurdata.id with documents.ref_id
+      if (data && data.length > 0) {
+        const recordIds = data
+          .map(record => record.id)
+          .filter(id => id !== undefined && id !== null);
+
+        if (recordIds.length > 0) {
+          const placeholders = recordIds.map(() => '?').join(',');
+          const documentsQuery = `
+            SELECT 
+              id,
+              document_type,
+              document_path,
+              ref_id,
+              created_at
+            FROM documents
+            WHERE type = 'lead' AND ref_id IN (${placeholders})
+          `;
+
+          const documents = await ggBaseQuery(documentsQuery, recordIds);
+          const documentsMap = {};
+
+          if (documents && documents.length > 0) {
+            documents.forEach(doc => {
+              if (!documentsMap[doc.ref_id]) {
+                documentsMap[doc.ref_id] = [];
+              }
+
+              documentsMap[doc.ref_id].push({
+                id: doc.id,
+                document_type: doc.document_type,
+                document_path: doc.document_path,
+                document_url: doc.document_path ? `${PublicBasePath}${doc.document_path}` : null,
+                created_at: doc.created_at
+              });
+            });
+          }
+
+          // Attach documents to each record
+          data.forEach(record => {
+            record.documents = documentsMap[record.id] || [];
+          });
+        } else {
+          data.forEach(record => {
+            record.documents = [];
+          });
+        }
+      }
+  
+      const lastPage = Math.ceil(total / pageCount) || 1;
+  
+      res.json({
+        status: true,
+        data: data,
+        pagination: {
+          current_page: page,
+          per_page: pageCount,
+          total,
+          last_page: lastPage,
+          from: total > 0 ? (page - 1) * pageCount + 1 : 0,
+          to: Math.min(page * pageCount, total),
+        },
+      });
+    } catch (error) {
+      console.error("Error in recordsview:", error);
+      res.status(500).json({
+        status: false,
+        message: "Something went wrong!",
+        error: error.message,
+      });
+    }
+  };
+
+const getStatus = async (req, res) => {
+    try {
+        const { userId } = req.user;
+        
+        // Get user role from users table
+        const userRole = await ggBaseQuery(`
+            SELECT r.name as role
+            FROM users u
+            join user_roles ur on ur.user_id = u.id
+            join roles r on r.id = ur.role_id
+            WHERE u.id = ?
+
+        `, [userId]);
+        
+        const role = userRole && userRole.length > 0 && userRole[0].role ? userRole[0].role : null;
+        
+        // Build query - exclude id 5 if user is agent, or show only ids 2,4,5 if operation
+        let statusQuery = `SELECT id, name FROM statuses WHERE is_active = 1`;
+        const queryParams = [];
+        
+        if (role === "agent") {
+            statusQuery += ` AND id != ?`;
+            queryParams.push(5);
+        } else if (role === "operations") {
+            statusQuery += ` AND id IN (?, ?, ?)`;
+            queryParams.push(2, 4, 5);
+        }
+        
+        statusQuery += ` ORDER BY id ASC`;
+        
+        const statusResult = await ggBaseQuery(statusQuery, queryParams);
+        
+        res.json({
+            status: true,
+            data: statusResult
+        });
+    } catch (error) {
+        console.error("Error in getStatus:", error);
+        res.status(500).json({
+            status: false,
+            message: "Something went wrong!",
+            error: error.message,
+        });
+    }
+};
+
+const getSubstatus = async (req, res) => {
+    try {
+        const { statusId } = req.params;
+        const { userId } = req.user;
+
+        // Validate statusId
+        if (!statusId) {
+            return res.status(400).json({
+                status: false,
+                message: "Status ID is required."
+            });
+        }
+
+        // Determine user role
+        const userRole = await ggBaseQuery(
+            `
+            SELECT r.name as role
+            FROM users u
+            join user_roles ur on ur.user_id = u.id
+            join roles r on r.id = ur.role_id
+            WHERE u.id = ?
+        `,
+            [userId]
+        );
+
+        const role =
+            userRole && userRole.length > 0 && userRole[0].role ? userRole[0].role : null;
+
+        // Build query for substatuses, excluding specific ids for agents
+        let substatusQuery = `SELECT id, name FROM substatuses WHERE status_id = ? AND is_active = 1`;
+        const queryParams = [statusId];
+
+        if (role === "agent") {
+            const excludedIds = [21, 11, 3, 9];
+            const placeholders = excludedIds.map(() => "?").join(", ");
+            substatusQuery += ` AND id NOT IN (${placeholders})`;
+            queryParams.push(...excludedIds);
+        }
+        substatusQuery += ` ORDER BY id ASC`;
+
+        const substatusResult = await ggBaseQuery(substatusQuery, queryParams);
+
+        res.json({
+            status: true,
+            data: substatusResult
+        });
+    } catch (error) {
+        console.error("Error in getSubstatus:", error);
+        res.status(500).json({
+            status: false,
+            message: "Something went wrong!",
+            error: error.message,
+        });
+    }
+};
+
+const updateInsurDataStatus = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status, sub_status, latterdate, remarks } = req.body;
+        const { userId } = req.user;
+
+        // Validate required parameters
+        if (!id) {
+            return res.status(400).json({
+                status: false,
+                message: "Record ID is required."
+            });
+        }
+
+        if (status === undefined && sub_status === undefined) {
+            return res.status(400).json({
+                status: false,
+                message: "At least one of status or sub_status is required."
+            });
+        }
+
+        // Check if the record exists in insurdata table
+        const existingRecord = await ggBaseQuery(
+            `SELECT id, status, sub_status FROM insurdata WHERE id = ?`,
+            [id]
+        );
+
+        if (!existingRecord || existingRecord.length === 0) {
+            return res.status(404).json({
+                status: false,
+                message: "Record not found in insurdata table."
+            });
+        }
+
+        // Build update query dynamically based on provided fields
+        const updateFields = [];
+        const updateValues = [];
+
+        let shouldUpdateLatterDate = false;
+        let newLatterDateValue = null;
+
+        if (status !== undefined) {
+            updateFields.push('status = ?');
+            updateValues.push(status);
+
+            if (Number(status) === 3) {
+                shouldUpdateLatterDate = true;
+                if (latterdate) {
+                    newLatterDateValue = isNaN(Date.parse(latterdate))
+                        ? latterdate
+                        : new Date(latterdate).toISOString().slice(0, 19).replace('T', ' ');
+                } else {
+                    const now = new Date();
+                    newLatterDateValue = now.toISOString().slice(0, 19).replace('T', ' ');
+                }
+                updateFields.push('LATTERDATE = ?');
+                updateValues.push(newLatterDateValue);
+            }
+        }
+
+        if (sub_status !== undefined) {
+            updateFields.push('sub_status = ?');
+            updateValues.push(sub_status);
+        }
+
+        // Always update updated_at timestamp
+        updateFields.push('updated_at = NOW()');
+
+        // Add id to update values for WHERE clause
+        updateValues.push(id);
+
+        // Execute main update query (status and sub_status)
+        const updateQuery = `
+            UPDATE insurdata 
+            SET ${updateFields.join(', ')} 
+            WHERE id = ?
+        `;
+
+        await ggBaseQuery(updateQuery, updateValues);
+
+        // Update status_history if status is being updated (separate query for resilience)
+        if (status !== undefined) {
+            try {
+                // Get status name from statuses table
+                const statusQuery = `SELECT name FROM statuses WHERE id = ? AND is_active = 1`;
+                const statusResult = await ggBaseQuery(statusQuery, [status]);
+                
+                if (statusResult && statusResult.length > 0) {
+                    const statusName = statusResult[0].name;
+                    // Get existing status_history or create new one
+                    const historyQuery = `SELECT status_history FROM insurdata WHERE id = ?`;
+                    const historyResult = await ggBaseQuery(historyQuery, [id]);
+                    
+                    let statusHistory = [];
+                    if (historyResult && historyResult[0] && historyResult[0].status_history) {
+                        try {
+                            const parsed = JSON.parse(historyResult[0].status_history);
+                            statusHistory = Array.isArray(parsed) ? parsed : [parsed];
+                        } catch (e) {
+                            statusHistory = [];
+                        }
+                    }
+                    
+                    // Add new status entry
+                    statusHistory.push({
+                        status: statusName,
+                        status_id: status,
+                        date: new Date().toISOString()
+                    });
+                    
+                    // Update status_history separately
+                    await ggBaseQuery(
+                        `UPDATE insurdata SET status_history = ? WHERE id = ?`,
+                        [JSON.stringify(statusHistory), id]
+                    );
+                }
+            } catch (historyError) {
+                // Log error but don't fail the entire request
+                console.error("Error updating status_history:", historyError);
+            }
+        }
+
+        // Add remarks if provided
+        if (remarks && remarks.trim() !== "") {
+            await remarksEntry([remarks, "insurdata", id, "agent", userId]);
+        }
+
+        const responseData = {
+            id: id,
+            status: status !== undefined ? status : existingRecord[0].status,
+            sub_status: sub_status !== undefined ? sub_status : existingRecord[0].sub_status
+        };
+
+        if (shouldUpdateLatterDate && newLatterDateValue) {
+            responseData.latterdate = newLatterDateValue;
+        }
+
+        res.json({
+            status: true,
+            message: "Record status and substatus updated successfully.",
+            data: responseData
+        });
+    } catch (error) {
+        console.error("Error in updateInsurDataStatus:", error);
+        res.status(500).json({
+            status: false,
+            message: "Something went wrong!",
+            error: error.message,
+        });
+    }
+};
+
+const uploadDocuments = async (req, res) => {
+    try {
+        const { userId } = req.user;
+        const { type, ref_id, doc_count } = req.body;
+
+        // Validate required fields
+        if (!type) {
+            return res.status(400).json({
+                status: false,
+                message: "Type is required (e.g., 'lead', 'insurdata')."
+            });
+        }
+
+        if (!ref_id) {
+            return res.status(400).json({
+                status: false,
+                message: "Reference ID (ref_id) is required."
+            });
+        }
+
+        if (!req.files || Object.keys(req.files).length === 0) {
+            return res.status(400).json({
+                status: false,
+                message: "No files were uploaded."
+            });
+        }
+
+        const documentCount = Number(doc_count);
+
+        if (!Number.isInteger(documentCount) || documentCount <= 0) {
+            return res.status(400).json({
+                status: false,
+                message: "Document count (doc_count) is required and must be greater than 0."
+            });
+        }
+
+        // Set module and ref_id for docUploader
+        req.module = type;
+        req.ref_id = ref_id;
+        req.body.doc_count = documentCount;
+
+        // Determine module path based on type
+        let modulePath = 'documents';
+        if (type === 'lead') {
+            modulePath = 'leads/documents';
+        } else if (type === 'insurdata') {
+            modulePath = 'insurdata/documents';
+        } else {
+            modulePath = `${type}/documents`;
+        }
+
+        // Upload documents using existing docUploader function
+        // This function handles file storage and database insertion
+        await docUploader(req, req.files, modulePath);
+
+        // // Fetch uploaded documents to return in response
+        // const uploadedDocs = await ggBaseQuery(
+        //     `SELECT id, document_type, type, CONCAT('${PublicBasePath}', document_path) AS document_path, created_at 
+        //      FROM documents 
+        //      WHERE type = ? AND ref_id = ? 
+        //      ORDER BY created_at DESC 
+        //      LIMIT ?`,
+        //     [type, ref_id, documentCount]
+        // );
+
+        res.status(200).json({
+            status: true,
+            message: 'Documents uploaded successfully and stored in database.',
+            // data: uploadedDocs,
+            // count: uploadedDocs.length
+        });
+    } catch (error) {
+        console.error('Error uploading documents:', error);
+        res.status(500).json({
+            status: false,
+            message: 'Something went wrong while uploading documents.',
+            error: error.message
+        });
+    }
+};
+
 export default {
     index,
     add,
     update,
     view,
-    deleteItem
+    deleteItem,
+    recordsview,
+    getStatus,
+    getSubstatus,
+    updateInsurDataStatus,
+    uploadDocuments
 }

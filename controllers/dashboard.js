@@ -1552,7 +1552,10 @@ const previewModuleReports = async (leads, selected_users, max_leads_per_employe
                 unassigned_leads: unassigned,
             },
         };
-        return finalOut;
+
+
+        return res.json(finalOut);
+
     } catch (err) {
         console.error("previewModuleReports error:", err);
         return res.status(500).json({
@@ -1669,176 +1672,207 @@ const LeadPreviewModule = async (req, res) => {
     }
 };
 const LeadTeamsPreviewModule = async (req, res) => {
-    try {
-        const {
-            filters,
-            year_filters,
-            user_ids,
-            max_leads_per_employee,
-            is_preview,
-            selected_users
-        } = req.body;
-        const userId = req.userId;
-        if (!filters || !year_filters) {
-            return res.status(400).json({
-                error: "Missing filters or year_filters",
-            });
-        }
-        // 1️⃣ Base WHERE clauses
-        const baseClauses = [];
-        if (filters.prev_policy_type.length) {
-            baseClauses.push(`prev_policy_type IN (${filters.prev_policy_type
+  try {
+    const {
+      filters,
+      year_filters,
+      user_ids,
+      max_leads_per_employee,
+      is_preview,
+      selected_users,
+    } = req.body;
+    const userId = req.userId;
+
+    if (!filters || !year_filters) {
+      return res.status(400).json({
+        error: "Missing filters or year_filters",
+      });
+    }
+
+    // 1️⃣ Base WHERE clauses
+    const baseClauses = [];
+    if (filters.prev_policy_type.length) {
+      baseClauses.push(
+        `prev_policy_type IN (${filters.prev_policy_type
           .map((v) => `'${v.replace(/'/g, "''")}'`)
-          .join(",")})`);
-        }
-        if (filters.states.length) {
-            baseClauses.push(`state IN (${filters.states
+          .join(",")})`
+      );
+    }
+    if (filters.states.length) {
+      baseClauses.push(
+        `state IN (${filters.states
           .map((v) => `'${v.replace(/'/g, "''")}'`)
-          .join(",")})`);
-        }
-        if (filters.rf !== undefined && filters.rf !== null && filters.rf !== "") {
-            baseClauses.push(`is_lead_type = ${
+          .join(",")})`
+      );
+    }
+    if (filters.rf !== undefined && filters.rf !== null && filters.rf !== "") {
+      baseClauses.push(
+        `is_lead_type = ${
           typeof filters.rf === "number" ? filters.rf : `'${filters.rf}'`
-        }`);
-        }
-        const baseWhere = baseClauses.length ? baseClauses.join(" AND ") : "1=1";
-        // ✅ Use an array, concat results in batches
-        let finalRows = [];
-        // 2️⃣ Iterate over year_filters
-        for (const [yearStr, yrFilter] of Object.entries(year_filters)) {
-            const year = parseInt(yearStr, 10);
-            if (Number.isNaN(year)) continue;
-            const yearClauses = [baseWhere, `YEAR(prev_policy_end_date) = ${year}`];
-            if (yrFilter.start && yrFilter.end) {
-                yearClauses.push(`prev_policy_end_date BETWEEN '${yrFilter.start}' AND '${yrFilter.end}'`);
-            }
-            const whereForYear = `WHERE ${yearClauses.join(" AND ")}`;
-            // 3️⃣ Count query
-            const countSql = `SELECT COUNT(*) AS cnt FROM temp_leads_management ${whereForYear};`;
-            const countRes = await ggBaseQuery(countSql);
-            const cnt = countRes && countRes[0] && countRes[0].cnt ? Number(countRes[0].cnt) : 0;
-            // 4️⃣ Percent calc
-            const percent = Number(yrFilter.percent) || 100;
-            const take = Math.floor(cnt * (percent / 100));
-            if (take <= 0) continue;
-            // 5️⃣ Select query
-            // const selectSql = `
-            //   SELECT id, reg_no, name, mobile, is_lead_type, prev_policy_end_date
-            //   FROM temp_leads_management
-            //   ${whereForYear}
-            //   ORDER BY prev_policy_end_date
-            //   LIMIT ${take};
-            // `;
-            const selectSql = `
+        }`
+      );
+    }
+
+    const baseWhere = baseClauses.length ? baseClauses.join(" AND ") : "1=1";
+
+    let finalRows = [];
+
+    // 2️⃣ Iterate over year_filters (yearly fetch)
+    for (const [yearStr, yrFilter] of Object.entries(year_filters)) {
+      const year = parseInt(yearStr, 10);
+      if (Number.isNaN(year)) continue;
+
+      const yearClauses = [baseWhere, `YEAR(prev_policy_end_date) = ${year}`];
+      if (yrFilter.start && yrFilter.end) {
+        yearClauses.push(
+          `prev_policy_end_date BETWEEN '${yrFilter.start}' AND '${yrFilter.end}'`
+        );
+      }
+
+      const whereForYear = `WHERE ${yearClauses.join(" AND ")}`;
+
+      // 3️⃣ Count total available
+      const countSql = `SELECT COUNT(*) AS cnt FROM temp_leads_management ${whereForYear} AND is_assigned = 0;`;
+      const countRes = await ggBaseQuery(countSql);
+      const totalCount =
+        countRes && countRes[0] && countRes[0].cnt ? Number(countRes[0].cnt) : 0;
+
+      // 4️⃣ Determine exact count to fetch (use filtered key instead of percent)
+      const take = Number(yrFilter.filtered) || 0;
+      if (take <= 0) continue;
+
+      // Make sure not exceeding total
+      const safeTake = Math.min(take, totalCount);
+
+      // 5️⃣ Fetch leads for that year (limit by filtered count)
+      const selectSql = `
         SELECT id
         FROM temp_leads_management
-        ${whereForYear} AND is_assigned =0
+        ${whereForYear}
+        AND is_assigned = 0
         ORDER BY prev_policy_end_date ASC
-        LIMIT ${take};
+        LIMIT ${safeTake};
       `;
-            console.log(selectSql);
-            const rows = await ggBaseQuery(selectSql);
-            // ✅ Avoid spread (...rows) which can blow stack on large arrays
-            if (rows && rows.length) {
-                for (const r of rows) {
-                    // shallow copy → strips DB driver prototypes/circular refs
-                    finalRows.push({ ...r
-                    });
-                }
-            }
+
+      console.log(`🟢 Year ${year}: Fetching ${safeTake} leads`);
+
+      console.log(selectSql);
+      
+      const rows = await ggBaseQuery(selectSql);
+
+      if (rows && rows.length) {
+        for (const r of rows) {
+          finalRows.push({ ...r });
         }
-        const thisLeads = finalRows.map(lead => lead.id);
-        if (!thisLeads || !thisLeads.length) {
-            return res.status(400).json({
-                error: "No leads provided"
-            });
-        }
-        const team_lead_ids = selected_users;
-        if (!team_lead_ids || !Object.keys(team_lead_ids).length) {
-            return res.status(400).json({
-                error: "team_lead_ids required"
-            });
-        }
-        let thisResponse = {};
-        if (is_preview) {
-            thisResponse = await previewModuleReports(thisLeads, team_lead_ids, max_leads_per_employee, res);
-        } else {
-            thisResponse = await assignLeadsModule(thisLeads, team_lead_ids, max_leads_per_employee, userId, res);
-        }
-        // 6️⃣ Return safe JSON
-        return res.json(thisResponse);
-    } catch (err) {
-        console.error("fetchFilteredLeadsAndSample error:", err);
-        return res.status(500).json({
-            error: "Server error",
-            detail: err.message,
-        });
+      }
     }
+
+    // 6️⃣ Prepare Leads
+    const thisLeads = finalRows.map((lead) => lead.id);
+    if (!thisLeads.length) {
+      return res.status(400).json({
+        error: "No leads found based on given filters",
+      });
+    }
+
+    // 7️⃣ Handle Team Users
+    const team_lead_ids = selected_users;
+    if (!team_lead_ids || !Object.keys(team_lead_ids).length) {
+      return res.status(400).json({
+        error: "selected_users (team leads) required",
+      });
+    }
+
+    // 8️⃣ Preview / Assign Mode
+    let thisResponse = {};
+    if (is_preview) {
+      thisResponse = await previewModuleReports(
+        thisLeads,
+        team_lead_ids,
+        max_leads_per_employee,
+        res
+      );
+    } else {
+      thisResponse = await assignLeadsModule(
+        thisLeads,
+        team_lead_ids,
+        max_leads_per_employee,
+        userId,
+        res
+      );
+    }
+
+    // 9️⃣ Return Safe JSON
+    // return res.json(thisResponse);
+  } catch (err) {
+    console.error("LeadTeamsPreviewModule error:", err);
+    return res.status(500).json({
+      error: "Server error",
+      detail: err.message,
+    });
+  }
 };
 const assignLeadsModule = async (leads, team_lead_ids, max_leads_per_employee, user_id, res) => {
-    try {
-        const MAX_LEADS_PER_EXEC = max_leads_per_employee || 150;
-        if (!leads.length) {
-            return res.status(400).json({
-                error: "No leads provided"
-            });
-        }
-        if (!team_lead_ids.length) {
-            return res.status(400).json({
-                error: "team_lead_ids required"
-            });
-        }
-        // 🔹 Build team placeholders
-        const placeholders = team_lead_ids.map((id) => `${id}`).join(",");
-        // 1️⃣ Fetch team leads
-        const teamLeads = await ggBaseQuery(`
-     SELECT id, name 
-      FROM teams  
-      WHERE id IN (${placeholders}) AND status = 'active'
-    `);
-        // 2️⃣ Fetch executives
-        const executives = await ggBaseQuery(`
-      SELECT u.id,u.name,tm.team_id as leader_id
-      FROM team_members tm
-LEFT JOIN users u ON u.id = tm.user_id
-            WHERE tm.team_id IN (${placeholders}) 
-      ORDER BY tm.team_id, u.id ASC
-    `);
-        // 3️⃣ Prepare executive mapping
-        const execByTeam = {};
-        for (const exec of executives) {
-            if (!execByTeam[exec.leader_id]) execByTeam[exec.leader_id] = [];
-            execByTeam[exec.leader_id].push({ ...exec,
-                current_assigned: 0
-            });
-        }
-        // Flatten in round-robin order (TL1-E1, TL2-E1, TL1-E2, TL2-E2...)
-        let flatExecList = [];
-        const maxTeamExecutives = Math.max(...Object.values(execByTeam).map((arr) => arr.length));
-        for (let i = 0; i < maxTeamExecutives; i++) {
-            for (const tid of team_lead_ids) {
-                const exec = execByTeam[tid][i];
-                if (exec) flatExecList.push(exec);
-            }
-        }
-        if (!flatExecList.length) {
-            return res.status(404).json({
-                error: "No executives available"
-            });
-        }
-        // 4️⃣ Round-robin assignment
-        let execIndex = 0;
-        const totalLeads = leads.length;
-        const unassigned = [];
-        for (const leadId of leads) {
-            let assigned = false;
-            let attempts = 0;
-            while (attempts < flatExecList.length) {
-                const exec = flatExecList[execIndex];
-                const team_lead_id = exec.leader_id;
-                if (exec.current_assigned < MAX_LEADS_PER_EXEC) {
-                    // ✅ Full insert with TEAMLEADER, EXECUTIVE, status, sub_status
-                    await ggBaseQuery(`
+  try {
+    const MAX_LEADS_PER_EXEC = max_leads_per_employee || 150;
+    if (!leads.length) return res.status(400).json({ error: "No leads provided" });
+    if (!team_lead_ids || !Object.keys(team_lead_ids).length)
+      return res.status(400).json({ error: "team_lead_ids required" });
+
+    // 1️⃣ Extract all team names
+    const teamNames = Object.keys(team_lead_ids).map((name) => name.trim());
+
+    // 2️⃣ Fetch team records from DB
+    const teamSql = `
+      SELECT id, name
+      FROM teams
+      WHERE name IN (${teamNames.map(() => "?").join(",")})
+        AND status = 'active'
+    `;
+    const teamLeads = await ggBaseQuery(teamSql, teamNames);
+
+    if (!teamLeads.length)
+      return res.status(404).json({ error: "No valid teams found" });
+
+    // 3️⃣ Build execByTeam mapping directly from request payload
+    const execByTeam = {};
+    for (const team of teamLeads) {
+      const execList = team_lead_ids[team.name] || [];
+      execByTeam[team.id] = execList.map((eid) => ({
+        id: eid,
+        leader_id: team.id,
+        current_assigned: 0,
+      }));
+    }
+
+    // 4️⃣ Flatten all executives across teams in round-robin pattern
+    let flatExecList = [];
+    const maxTeamExecutives = Math.max(...Object.values(execByTeam).map((arr) => arr.length));
+    for (let i = 0; i < maxTeamExecutives; i++) {
+      for (const tid of Object.keys(execByTeam)) {
+        const exec = execByTeam[tid][i];
+        if (exec) flatExecList.push(exec);
+      }
+    }
+
+    if (!flatExecList.length)
+      return res.status(404).json({ error: "No executives available for assignment" });
+
+    // 5️⃣ Begin round-robin lead assignment
+    let execIndex = 0;
+    const totalLeads = leads.length;
+    const unassigned = [];
+
+    for (const leadId of leads) {
+      let assigned = false;
+      let attempts = 0;
+
+      while (attempts < flatExecList.length) {
+        const exec = flatExecList[execIndex];
+        if (exec.current_assigned < MAX_LEADS_PER_EXEC) {
+          // ✅ Insert lead record
+          await ggBaseQuery(
+            `
             INSERT INTO insurdata (
               BIKESCOOTER, COMPANY, REGNO, REGDATE, TC, fuel, RED, PREVINS, PREVPOL_NO,
               NAME, ADDRESS, ENGINE_NO, CHASIS_NO, VEHICLEMAKE, VEHICLEMODEL, VARIANT,
@@ -1862,55 +1896,62 @@ LEFT JOIN users u ON u.id = tm.user_id
               prev_policy_type,
               product,
               sub_product,
-              NOW() AS created_at,
-              NOW() AS updated_at,
-              JSON_OBJECT('status', 'New', 'date', NOW()) AS status_history
+              NOW(),
+              NOW(),
+              JSON_OBJECT('status', 'New', 'date', NOW())
             FROM temp_leads_management
-            WHERE id = ?
-          `, [team_lead_id, exec.id, leadId]);
-                    // ✅ Update temp_leads_management tracking
-                    await ggBaseQuery(`
+            WHERE id = ?`,
+            [exec.leader_id, exec.id, leadId]
+          );
+
+          // ✅ Update temp_leads_management
+          await ggBaseQuery(
+            `
             UPDATE temp_leads_management
             SET is_assigned = 1,
                 executive_id = ?,
                 assigned_by = ?,
                 assigned_at = NOW()
-            WHERE id = ?
-          `, [exec.id, team_lead_id, user_id, leadId]);
-                    // ✅ Insert into logs
-                    await ggBaseQuery(`
-            INSERT INTO lead_assignment_logs (
-              lead_id, team_lead_id, executive_id, assigned_by, assigned_at, remarks
-            )
-            VALUES (?, ?, ?, ?, NOW(), ?)
-          `, [leadId, team_lead_id, exec.id, user_id, 'Initial lead assignment']);
-                    exec.current_assigned++;
-                    assigned = true;
-                    break;
-                }
-                execIndex = (execIndex + 1) % flatExecList.length;
-                attempts++;
-            }
-            if (!assigned) unassigned.push(leadId);
-            execIndex = (execIndex + 1) % flatExecList.length;
+            WHERE id = ?`,
+            [exec.id, exec.leader_id, leadId]
+          );
+
+          // ✅ Log assignment
+          await ggBaseQuery(
+            `
+            INSERT INTO lead_assignment_logs
+              (lead_id, team_lead_id, executive_id, assigned_by, assigned_at, remarks)
+            VALUES (?, ?, ?, ?, NOW(), ?)`,
+            [leadId, exec.leader_id, exec.id, user_id, 'Lead assigned successfully']
+          );
+
+          exec.current_assigned++;
+          assigned = true;
+          break;
         }
-        // ✅ Done
-        return res.json({
-            status: true,
-            message: "Leads assigned successfully",
-            data: {
-                total: totalLeads,
-                unassigned_total: unassigned.length,
-                unassigned_leads: unassigned,
-            },
-        });
-    } catch (err) {
-        console.error("assignLeadsModule error:", err);
-        return res.status(500).json({
-            error: "Server error",
-            detail: err.message,
-        });
+        execIndex = (execIndex + 1) % flatExecList.length;
+        attempts++;
+      }
+
+      if (!assigned) unassigned.push(leadId);
+      execIndex = (execIndex + 1) % flatExecList.length;
     }
+
+    // ✅ Final Response
+    return res.json({
+      status: true,
+      message: "Leads assigned successfully",
+      data: {
+        total: totalLeads,
+        assigned_total: totalLeads - unassigned.length,
+        unassigned_total: unassigned.length,
+        unassigned_leads: unassigned,
+      },
+    });
+  } catch (err) {
+    console.error("assignLeadsModule error:", err);
+    return res.status(500).json({ error: "Server error", detail: err.message });
+  }
 };
 const getExecutiveCcount = async (req, res) => {
     try {
@@ -2022,24 +2063,29 @@ async function listTeams(req, res) {
         const [countRows] = await ggBaseQuery(`SELECT COUNT(DISTINCT t.id) AS cnt 
        FROM teams t
        LEFT JOIN team_members tm ON tm.team_id = t.id
+       LEFT JOIN users tl ON tl.id = t.team_lead_id
        ${where}`, params);
         const total = countRows[0] && countRows[0].cnt || 0;
         // 📊 Team list with member count
         const teamQuery = `
       SELECT 
         t.*,
+        tl.name AS team_lead_name,
         COUNT(tm.id) AS member_count,
-    JSON_ARRAYAGG(
-       
-        JSON_OBJECT(
-            'name', u.name,
-            'id', u.id
-        )
-    ) AS member_data,
+        JSON_ARRAYAGG(
+          CASE 
+            WHEN u.id IS NOT NULL THEN JSON_OBJECT(
+              'name', u.name,
+              'id', u.id
+            )
+            ELSE NULL
+          END
+        ) AS member_data,
         GROUP_CONCAT(u.name ORDER BY u.name SEPARATOR ', ') AS member_names
       FROM teams t
       LEFT JOIN team_members tm ON tm.team_id = t.id
       LEFT JOIN users u ON u.id = tm.user_id
+      LEFT JOIN users tl ON tl.id = t.team_lead_id
       ${where}
       GROUP BY t.id
       ORDER BY t.created_at DESC
@@ -2170,12 +2216,13 @@ async function updateTeam(req, res) {
             location,
             vertical,
             status,
+            team_leader,
             members
         } = req.body;
         // 1️⃣ Update team basic info
         await ggBaseQuery(`UPDATE teams
-       SET name = ?, location = ?, vertical = ?, status = ?,updated_at = ?
-       WHERE id = ?`, [name, location.join(","), vertical.join(","), status, moment().format("YYYY-MM-DD HH:mm:ss"), id]);
+       SET name = ?, location = ?, vertical = ?, status = ?,team_lead_id = ?,updated_at = ?
+       WHERE id = ?`, [name, location.join(","), vertical.join(","), status,team_leader, moment().format("YYYY-MM-DD HH:mm:ss"), id]);
         // 2️⃣ Replace members
         if (Array.isArray(members)) {
             await ggBaseQuery(`DELETE FROM team_members WHERE team_id = ?`, [id]);
@@ -2224,24 +2271,64 @@ const getUserListWithOptions = async (req, res) => {
         const {
             locations = [], verticals = []
         } = filters;
-        // 🔹 Base query
-        let sql = `SELECT id, name, place_of_posting, vertical FROM users WHERE role NOT IN ('admin', 'super') AND status = 1`;
+        // 🔹 Base query with team leader join from user_roles table
+        // Join users table with user_roles and roles table to get team leader based on role comparison
+        // Get team leader name from users table where team_lead id matches user with Team_Lead role in roles table
+        let sql = `SELECT DISTINCT
+            u.id, 
+            u.name, 
+            u.place_of_posting, 
+            u.vertical
+        FROM users u
+        LEFT JOIN users tl ON u.team_lead = tl.id
+        LEFT JOIN user_roles ur_tl ON tl.id = ur_tl.user_id
+        LEFT JOIN roles r ON ur_tl.role_id = r.id AND r.name LIKE 'Team_Lead%'
+        WHERE u.role NOT IN ('admin', 'super') AND u.status = 1`;
         const params = [];
         // 🔸 Apply filters dynamically
         if (locations.length > 0) {
             const placeholders = locations.map(() => "?").join(", ");
-            sql += ` AND place_of_posting IN (${placeholders})`;
+            sql += ` AND u.place_of_posting IN (${placeholders})`;
             params.push(...locations);
         }
         if (verticals.length > 0) {
             const placeholders = verticals.map(() => "?").join(", ");
-            sql += ` AND vertical IN (${placeholders})`;
+            sql += ` AND u.vertical IN (${placeholders})`;
             params.push(...verticals);
         }
         // 🔹 Execute SQL
         const work_location_users = await ggBaseQuery(sql, params);
+        
+        // 🔹 Fetch team leaders list for dropdown (separate query)
+        // Get all users who have Team_Lead role from user_roles and roles tables
+        const teamLeadersQuery = `SELECT DISTINCT
+            u.id,
+            u.name
+        FROM users u
+        INNER JOIN user_roles ur ON u.id = ur.user_id
+        INNER JOIN roles r ON ur.role_id = r.id
+        WHERE r.name LIKE 'Team_Lead%' AND u.status = 1
+        ORDER BY u.name ASC`;
+        const teamLeaders = await ggBaseQuery(teamLeadersQuery, []);
+        
+        // 🔹 Format team leaders for dropdown (same format as other form_data)
+        const teamLeadersDropdown = (teamLeaders || []).map(tl => ({
+            label: tl.name,
+            value: tl.id.toString()
+        }));
+        
         // 🔹 Fetch dropdowns (verticals, locations)
         const getGlobalOptionsData = await getGlobalOptions();
+        
+        // 🔹 Add team_leaders_data to form_data object
+        if (getGlobalOptionsData.form_data) {
+            getGlobalOptionsData.form_data.team_leaders_data = teamLeadersDropdown;
+        } else {
+            getGlobalOptionsData.form_data = {
+                team_leaders_data: teamLeadersDropdown
+            };
+        }
+        
         // ✅ Final response
         res.json({
             status: true,
